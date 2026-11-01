@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Sign in</title>
+<style>
+  :root { --bg: #f4f5f8; --card: #fff; --fg: #1d2129; --dim: #5f6673; --line: #d8dbe2; --accent: #3f51b5; --bad: #c62828; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #15181e; --card: #1f232b; --fg: #e6e8ec; --dim: #9aa1ad; --line: #363b45; --accent: #7c8cf0; --bad: #ef7070; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  form { width: 100%; max-width: 360px; padding: 28px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+  h1 { margin: 0 0 20px; font-size: 22px; }
+  label { display: block; margin-bottom: 14px; color: var(--dim); font-size: 14px; }
+  input { display: block; width: 100%; margin-top: 4px; padding: 10px; background: transparent; color: var(--fg); border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+  button { width: 100%; padding: 11px; background: var(--accent); color: #fff; border: 0; border-radius: 6px; font: 600 16px system-ui, sans-serif; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: progress; }
+  #msg { min-height: 1.5em; margin: 12px 0 0; color: var(--bad); font-size: 14px; }
+  input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+<form id="login" autocomplete="on">
+  <h1>Sign in</h1>
+  <label>Username <input id="user" name="username" autocomplete="username" required></label>
+  <label>Password <input id="pass" name="password" type="password" autocomplete="current-password" required></label>
+  <button id="go">Sign in</button>
+  <p id="msg" role="alert"></p>
+</form>
+<script>
+// Served as index.html and as 404.html, so it can appear at any depth. Nothing here is secret.
+(async function () {
+  var BASE = '/study-site/', APP = BASE + 'app/', STORE = 'gate-v1';
+  var form = document.getElementById('login'), msg = document.getElementById('msg'), go = document.getElementById('go');
+  function db() {
+    return new Promise(function (ok, no) {
+      var r = indexedDB.open(STORE, 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore('keys'); };
+      r.onsuccess = function () { ok(r.result); };
+      r.onerror = function () { no(r.error); };
+    });
+  }
+  async function keys(action, value) {
+    var d = await db();
+    return new Promise(function (ok, no) {
+      var s = d.transaction('keys', action === 'get' ? 'readonly' : 'readwrite').objectStore('keys');
+      var r = action === 'get' ? s.get('k') : action === 'put' ? s.put(value, 'k') : s.delete('k');
+      r.onsuccess = function () { ok(r.result); };
+      r.onerror = function () { no(r.error); };
+    });
+  }
+  function hex(buf) { return Array.from(new Uint8Array(buf)).map(function (b) { return b.toString(16).padStart(2, '0'); }).join(''); }
+  function unhex(s) { return new Uint8Array(s.match(/../g).map(function (b) { return parseInt(b, 16); })); }
+  var q = new URLSearchParams(location.search);
+  var wanted = location.pathname.indexOf(APP) === 0 ? location.pathname + location.hash : (q.get('next') || '');
+  var target = wanted.indexOf(APP) === 0 ? wanted : APP + 'index.html';
+
+  function enter() { location.replace(target); }
+  if (!('serviceWorker' in navigator) || !window.crypto || !crypto.subtle || !window.indexedDB) {
+    msg.textContent = 'This browser cannot open this site. Private windows in some browsers block what it needs.';
+    go.disabled = true;
+    return;
+  }
+  var signingOut = q.has('signout');
+  if (signingOut) await keys('delete');
+  await navigator.serviceWorker.register(BASE + 'sw.js', { scope: BASE });
+  await navigator.serviceWorker.ready;
+  if (signingOut) {
+    history.replaceState(null, '', BASE);
+  } else if (await keys('get')) {
+    // The 404 page lands here when the worker did not answer. Do not bounce for ever if it never will.
+    var last = Number(sessionStorage.getItem('gate-enter') || 0);
+    if (Date.now() - last > 4000) { sessionStorage.setItem('gate-enter', String(Date.now())); return enter(); }
+    msg.textContent = 'The page could not be opened. Reload to try again.';
+  }
+
+  document.documentElement.setAttribute('data-ready', '1');
+  form.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    go.disabled = true; msg.textContent = '';
+    try {
+      var params = await (await fetch(BASE + 'vault/params.json', { cache: 'no-cache' })).json();
+      var secret = document.getElementById('user').value.trim() + '\n' + document.getElementById('pass').value;
+      var material = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), 'PBKDF2', false, ['deriveBits']);
+      var bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: unhex(params.salt), iterations: params.iterations }, material, 512);
+      var aes = await crypto.subtle.importKey('raw', bits.slice(0, 32), 'AES-GCM', false, ['decrypt']);
+      var mac = await crypto.subtle.importKey('raw', bits.slice(32), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      var name = hex(await crypto.subtle.sign('HMAC', mac, new TextEncoder().encode('.check'))).slice(0, 40);
+      var res = await fetch(BASE + 'vault/' + name + '.bin', { cache: 'no-cache' });
+      if (res.status === 404) throw new Error('wrong');
+      if (!res.ok) throw new Error('network');
+      var body = await res.arrayBuffer();
+      await crypto.subtle.decrypt({ name: 'AES-GCM', iv: body.slice(0, 12), additionalData: new TextEncoder().encode('.check') }, aes, body.slice(12));
+      await keys('put', { aes: aes, mac: mac });
+      enter();
+    } catch (err) {
+      msg.textContent = err.message === 'network' ? 'Could not reach the site. Check your connection.' : 'Wrong username or password.';
+      go.disabled = false;
+    }
+  });
+})().catch(function () { document.getElementById('msg').textContent = 'This browser blocked the site from starting. Try a normal window.'; });
+</script>
+</body>
+</html>
